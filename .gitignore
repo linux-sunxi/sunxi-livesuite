@@ -1,0 +1,7 @@
+awusb/.*.cmd
+awusb/.tmp_versions
+awusb/Module.symvers
+awusb/*.ko
+awusb/*.mod.c
+awusb/*.o
+awusb/modules.order
