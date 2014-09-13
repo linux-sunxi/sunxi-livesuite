@@ -46,8 +46,8 @@
 /*
  * Version Information
  */
-#define DRIVER_VERSION "v0.4"
-#define DRIVER_AUTHOR "Cesc"
+#define DRIVER_VERSION "v0.5"
+#define DRIVER_AUTHOR "Jojo"
 #define DRIVER_DESC "AW USB driver"
 
 #define AW_MINOR	64
@@ -55,22 +55,25 @@
 /* stall/wait timeout for AWUSB */
 #define NAK_TIMEOUT (HZ)
 
-#define IBUF_SIZE 0x1000
-
 /* Size of the AW buffer */
 #define OBUF_SIZE 0x10000
+#define IBUF_SIZE 0x500
+#define MAX_TIME_WAIT 6000000
 
-/* Max size of data from ioctl */
-#define IOCTL_SIZE 0x10000 /* 16k */
+#define USB_AW_VENDOR_ID	0x1f3a
+#define USB_AW_PRODUCT_ID	0xefe8
 
-struct aw_usb_data {
-        struct usb_device *aw_dev;     /* init: probe_aw */
-        unsigned int ifnum;             /* Interface number of the USB device */
-        int isopen;                     /* nz if open */
-        int present;                    /* Device is present on the bus */
-        char *obuf, *ibuf;              /* transfer buffers */
-        char bulk_in_ep, bulk_out_ep;   /* Endpoint assignments */
-        wait_queue_head_t wait_q;       /* for timeouts */
+struct allwinner_usb {
+	struct usb_device *aw_dev;     /* init: probe_aw */
+	struct usb_interface *aw_intf;	//store interface to get endpoint
+	unsigned int ifnum;             /* Interface number of the USB device */
+	int isopen;                     /* nz if open */
+	int present;                    /* Device is present on the bus */
+	char *obuf, *ibuf;              /* transfer buffers */
+	size_t	bulk_in_size;			/* the size of the receive buffer */
+	unsigned char bulk_in_endpointAddr; /* Endpoint assignments */
+	unsigned char bulk_out_endpointAddr; /* Endpoint assignments */
+	wait_queue_head_t wait_q;       /* for timeouts */
 	struct mutex lock;          /* general race avoidance */
 };
 
@@ -83,7 +86,7 @@ struct usb_param {
 };
 
 struct aw_command {
-    int value;
+	int value;
 	int length;
 	void __user *buffer; //? by Cesc
 };
@@ -97,202 +100,242 @@ struct aw_command {
 #define AWUSB_IOCRECV  _IOR(AWUSB_IOC_MAGIC, 4, struct aw_command)
 #define AWUSB_IOCSEND_RECV _IOWR(AWUSB_IOC_MAGIC, 5, struct aw_command) //how to implement it?
 
+/* table of devices that work with this driver */
+static const struct usb_device_id aw_table[] = {
+	{ USB_DEVICE(USB_AW_VENDOR_ID, USB_AW_PRODUCT_ID) },
+	{ }					/* Terminating entry */
+};
+MODULE_DEVICE_TABLE(usb, aw_table);
 
-static struct aw_usb_data aw_instance;
+static int probe_aw(struct usb_interface *intf,
+		const struct usb_device_id *id);
+static void disconnect_aw(struct usb_interface *intf);
+
+static struct usb_driver aw_driver = {
+	.name =		"allwinner",
+	.probe =	probe_aw,
+	.disconnect =	disconnect_aw,
+	.id_table =	aw_table,
+};
+
+static struct allwinner_usb aw_instance;
 
 static int open_aw(struct inode *inode, struct file *file)
 {
-	struct aw_usb_data *aw = &aw_instance;
+	struct allwinner_usb *aw = &aw_instance;
+	struct usb_interface* intf;// = aw->aw_intf; 
+	struct usb_host_interface *iface_desc;
+	struct usb_endpoint_descriptor *endpoint;
+	int subminor;
+	int i;
 
 	if (aw->isopen || !aw->present) {
 		mutex_unlock(&(aw->lock));
 		return -EBUSY;
 	}
+
+	subminor = iminor(inode);
+	intf = usb_find_interface(&aw_driver, subminor);;
+	if(intf == NULL)
+		return -ENODEV;
+
+	iface_desc = intf->cur_altsetting;
+	aw->bulk_in_endpointAddr = 0;
+	aw->bulk_out_endpointAddr = 0;
+	for (i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
+		endpoint = &iface_desc->endpoint[i].desc;
+
+		if ( !aw->bulk_in_endpointAddr && usb_endpoint_is_bulk_in(endpoint)) {
+			/* we found a bulk in endpoint */
+			aw->bulk_in_endpointAddr = endpoint->bEndpointAddress;
+			printk(KERN_DEBUG"bulk_in_endpointAddr = %d\n", endpoint->bEndpointAddress);
+		}
+
+		if ( !aw->bulk_out_endpointAddr && usb_endpoint_is_bulk_out(endpoint)) {
+			/* we found a bulk out endpoint */
+			aw->bulk_out_endpointAddr = endpoint->bEndpointAddress;
+			printk(KERN_DEBUG"bulk_out_endpointAddr = %d\n", endpoint->bEndpointAddress);
+		}
+	}
+
+	if (!(aw->bulk_in_endpointAddr && aw->bulk_out_endpointAddr)) {
+		printk(KERN_ERR"Could not find both bulk-in and bulk-out endpoints");
+		return -EPIPE;
+	}
+
 	aw->isopen = 1;
-
 	init_waitqueue_head(&aw->wait_q);
-
-	dev_info(&aw->aw_dev->dev, "******* awdev driver v1.3 device opened. **********\n");
 
 	return 0;
 }
 
 static int close_aw(struct inode *inode, struct file *file)
 {
-	struct aw_usb_data *aw = &aw_instance;
+	struct allwinner_usb *aw = &aw_instance;
 
 	aw->isopen = 0;
 
-	dev_info(&aw->aw_dev->dev, "aw closed.\n");
 	return 0;
 }
 
 static long ioctl_aw(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    struct aw_usb_data *aw = &aw_instance;
+	struct allwinner_usb *aw = &aw_instance;
 	int retval=0;
-    struct usb_param param_tmp;
+	struct usb_param param_tmp;
 
-    struct aw_command aw_cmd;
-    void __user *data;
-    int value = 0;
-    int buffer_len = 0;
+	struct aw_command aw_cmd;
+	void __user *data;
+	int value = 0;
+	int buffer_len = 0;
 
-    int result = 0;
-    int actual_len = 0;
+	int result = 0;
+	int actual_len = 0;
+	unsigned int nPipe = 0;
 
-    mutex_lock(&(aw->lock));
-    if (aw->present == 0 || aw->aw_dev == NULL) {
-        retval = -ENODEV;
-        goto err_out;
-    }
-
-    printk(KERN_DEBUG"ioctl_aw--enter\n");
-
-    printk(KERN_DEBUG"cmd = %d\n", cmd);
-
-    param_tmp.test_num = 0;
-    param_tmp.p1 = 0;
-    param_tmp.p2 = 0;
-    param_tmp.p3 = 0;
-    
-        
-	switch (cmd) {
-	case AWUSB_IOCRESET:
-        printk(KERN_DEBUG"ioctl_aw--AWUSB_IOCRESET\n");
-		break;
-
-	case AWUSB_IOCSET:
-        printk(KERN_DEBUG"ioctl_aw--AWUSB_IOCSET\n");
-        
-        if (copy_from_user(&param_tmp, (void __user *)arg, sizeof(param_tmp)))
-		    retval= -EFAULT;
-
-        printk(KERN_DEBUG"param_tmp.test_num = %d\n", param_tmp.test_num);
-        printk(KERN_DEBUG"param_tmp.p1 = %d\n", param_tmp.p1);
-        printk(KERN_DEBUG"param_tmp.p2 = %d\n", param_tmp.p2);
-        printk(KERN_DEBUG"param_tmp.p3 = %d\n", param_tmp.p3);
-                    
-		break;
-        
-   case AWUSB_IOCGET:
-        printk(KERN_DEBUG"ioctl_aw--AWUSB_IOCGET\n"); 
-        
-        param_tmp.test_num = 3;
-        param_tmp.p1 = 4;
-        param_tmp.p2 = 5;
-        param_tmp.p3 = 6;
-
-        if (copy_to_user((void __user *)arg, &param_tmp, sizeof(param_tmp)))
-		    retval= -EFAULT;
-               
-        break;
-
-    case AWUSB_IOCSEND:
-        printk(KERN_DEBUG"ioctl_aw--AWUSB_IOCSEND\n"); 
-        
-        data = (void __user *) arg;
-        if (data == NULL)
-            break;
-
-        if (copy_from_user(&aw_cmd, data, sizeof(struct aw_command))) {
-            retval = -EFAULT;
-            goto err_out;
-        }
-
-        buffer_len = aw_cmd.length;
-        value = aw_cmd.value;
-        printk(KERN_DEBUG"buffer_len=%d\n", buffer_len);
-        if (buffer_len > IOCTL_SIZE) {
-            retval = - EINVAL;
-            goto err_out;
-        }
-        
-        // stage 1, get data from app
-        if (copy_from_user(aw->obuf, aw_cmd.buffer, aw_cmd.length)) {
-            retval = -EFAULT;
-            goto err_out;
-        }
-		
-        //stage 2, send data to usb device
-        result = usb_bulk_msg(aw->aw_dev,
-					  usb_sndbulkpipe(aw->aw_dev, 1),
-					  aw->obuf, buffer_len, &actual_len, 0);  
-        if (result) {
-            printk(KERN_ERR"Write Whoops - %d", (int)result);
-            retval = result;
-            goto err_out;
-        }
-        
-        printk(KERN_DEBUG"ioctl_aw--AWUSB_IOCSEND-exit\n"); 
-        break;
-
-    case AWUSB_IOCRECV:
-        printk(KERN_DEBUG"ioctl_aw--AWUSB_IOCRECV\n"); 
-        
-        data = (void __user *) arg;
-        if (data == NULL)
-            break;
-        if (copy_from_user(&aw_cmd,data, sizeof(struct aw_command))) {
-            retval = -EFAULT;
-            goto err_out;
-        }
-        if (aw_cmd.length < 0) {
-            retval = - EINVAL;
-            goto err_out;
-        }
-        buffer_len = aw_cmd.length;
-        value = aw_cmd.value;
-        printk(KERN_DEBUG"buffer_len=%d\n", buffer_len);
-        if (buffer_len > IBUF_SIZE) {
-            retval = - EINVAL;
-            goto err_out;
-        }
-
-        memset(aw->ibuf, 0x00, IBUF_SIZE);
-        
-        // stage 1, get data from usb device
-        result = usb_bulk_msg(aw->aw_dev,
-					  usb_rcvbulkpipe(aw->aw_dev, 2),
-					  aw->ibuf, buffer_len, &actual_len, 0);
-
-        if (result) {
-            printk(KERN_ERR"Read Whoops - %d", result);
-            retval = result;
-            goto err_out;
-        }
-
-        // stage 2, copy data to app in user space
-        if (copy_to_user(aw_cmd.buffer, aw->ibuf, aw_cmd.length)) {
-            retval = - EFAULT;
-            goto err_out;
-        }
-        break;
-
-    case AWUSB_IOCSEND_RECV:
-        printk(KERN_DEBUG"ioctl_aw--AWUSB_IOCSEND_RECV\n");
-        
-        break;
-        
-	default:
-        retval = -ENOTTY;
-		break;
+	mutex_lock(&(aw->lock));
+	if (aw->present == 0 || aw->aw_dev == NULL) {
+		retval = -ENODEV;
+		goto err_out;
 	}
-        
-    printk(KERN_DEBUG"ioctl_aw--exit\n");
+
+	param_tmp.test_num = 0;
+	param_tmp.p1 = 0;
+	param_tmp.p2 = 0;
+	param_tmp.p3 = 0;
+
+
+	switch (cmd) {
+		case AWUSB_IOCRESET:
+			printk(KERN_DEBUG"ioctl_aw--AWUSB_IOCRESET\n");
+			break;
+
+		case AWUSB_IOCSET:    
+
+			if (copy_from_user(&param_tmp, (void __user *)arg, sizeof(param_tmp)))
+				retval= -EFAULT;
+
+			printk(KERN_DEBUG"param_tmp.test_num = %d\n", param_tmp.test_num);
+			printk(KERN_DEBUG"param_tmp.p1 = %d\n", param_tmp.p1);
+			printk(KERN_DEBUG"param_tmp.p2 = %d\n", param_tmp.p2);
+			printk(KERN_DEBUG"param_tmp.p3 = %d\n", param_tmp.p3);
+
+			break;
+
+		case AWUSB_IOCGET:
+
+			param_tmp.test_num = 3;
+			param_tmp.p1 = 4;
+			param_tmp.p2 = 5;
+			param_tmp.p3 = 6;
+
+			if (copy_to_user((void __user *)arg, &param_tmp, sizeof(param_tmp)))
+				retval= -EFAULT;
+
+			break;
+
+		case AWUSB_IOCSEND:
+
+			data = (void __user *) arg;
+			if (data == NULL)
+				break;
+
+			if (copy_from_user(&aw_cmd, data, sizeof(struct aw_command))) {
+				retval = -EFAULT;
+				goto err_out;
+			}
+
+			buffer_len = aw_cmd.length;
+			value = aw_cmd.value;
+
+			if (buffer_len > OBUF_SIZE) {
+				retval = - EINVAL;
+				goto err_out;
+			}
+
+			// stage 1, get data from app
+			if (copy_from_user(aw->obuf, aw_cmd.buffer, aw_cmd.length)) {
+				retval = -EFAULT;
+				goto err_out;
+			}
+
+			//stage 2, send data to usb device
+			nPipe = usb_sndbulkpipe(aw->aw_dev, aw->bulk_out_endpointAddr);
+			result = usb_bulk_msg(aw->aw_dev, nPipe,
+					aw->obuf, buffer_len, &actual_len, MAX_TIME_WAIT);  
+			if (result) {
+				printk(KERN_ERR"Write Whoops - %d", (int)result);
+				printk(KERN_ERR"send pipe - %u", nPipe);
+				retval = result;
+				goto err_out;
+			}
+
+			break;
+
+		case AWUSB_IOCRECV:
+
+			data = (void __user *) arg;
+			if (data == NULL)
+				break;
+			if (copy_from_user(&aw_cmd,data, sizeof(struct aw_command))) {
+				retval = -EFAULT;
+				goto err_out;
+			}
+			if (aw_cmd.length < 0) {
+				retval = - EINVAL;
+				goto err_out;
+			}
+			buffer_len = aw_cmd.length;
+			value = aw_cmd.value;
+
+			if (buffer_len > aw->bulk_in_size) {
+				retval = - EINVAL;
+				goto err_out;
+			}
+
+			memset(aw->ibuf, 0x00, aw->bulk_in_size);
+
+			// stage 1, get data from usb device
+			nPipe = usb_rcvbulkpipe(aw->aw_dev, aw->bulk_in_endpointAddr);
+			result = usb_bulk_msg(aw->aw_dev, nPipe,
+					aw->ibuf, buffer_len, &actual_len, MAX_TIME_WAIT);
+
+			if (result) {
+				printk(KERN_ERR"Read Whoops - %d", result);
+				printk(KERN_ERR"Receive pipe - %u", nPipe);
+				retval = result;
+				goto err_out;
+			}
+
+			// stage 2, copy data to app in user space
+			if (copy_to_user(aw_cmd.buffer, aw->ibuf, aw_cmd.length)) {
+				retval = - EFAULT;
+				goto err_out;
+			}
+			break;
+
+		case AWUSB_IOCSEND_RECV:
+			printk(KERN_DEBUG"ioctl_aw--AWUSB_IOCSEND_RECV\n");
+
+			break;
+
+		default:
+			retval = -ENOTTY;
+			break;
+	}
 
 err_out:
-    mutex_unlock(&(aw->lock));
+	mutex_unlock(&(aw->lock));
 	return retval;
 
 }
 
-static ssize_t
+	static ssize_t
 write_aw(struct file *file, const char __user *buffer,
-	  size_t count, loff_t * ppos)
+		size_t count, loff_t * ppos)
 {
 	DEFINE_WAIT(wait);
-	struct aw_usb_data *aw = &aw_instance;
+	struct allwinner_usb *aw = &aw_instance;
 
 	unsigned long copy_size;
 	unsigned long bytes_written = 0;
@@ -306,8 +349,8 @@ write_aw(struct file *file, const char __user *buffer,
 	intr = mutex_lock_interruptible(&(aw->lock));
 	if (intr)
 		return -EINTR;
-        /* Sanity check to make sure aw is connected, powered, etc */
-        if (aw->present == 0 || aw->aw_dev == NULL) {
+	/* Sanity check to make sure aw is connected, powered, etc */
+	if (aw->present == 0 || aw->aw_dev == NULL) {
 		mutex_unlock(&(aw->lock));
 		return -ENODEV;
 	}
@@ -319,7 +362,7 @@ write_aw(struct file *file, const char __user *buffer,
 		char *obuf = aw->obuf;
 
 		thistime = copy_size =
-		    (count >= OBUF_SIZE) ? OBUF_SIZE : count;
+			(count >= OBUF_SIZE) ? OBUF_SIZE : count;
 		if (copy_from_user(aw->obuf, buffer, copy_size)) {
 			errn = -EFAULT;
 			goto error;
@@ -336,11 +379,11 @@ write_aw(struct file *file, const char __user *buffer,
 			}
 
 			result = usb_bulk_msg(aw->aw_dev,
-					 usb_sndbulkpipe(aw->aw_dev, 2),
-					 obuf, thistime, &partial, 60000);
+					usb_sndbulkpipe(aw->aw_dev, aw->bulk_out_endpointAddr),
+					obuf, thistime, &partial, MAX_TIME_WAIT);
 
 			printk(KERN_DEBUG"write stats: result:%d thistime:%lu partial:%u",
-			     result, thistime, partial);
+					result, thistime, partial);
 
 			if (result == -ETIMEDOUT) {	/* NAK - so hold for a while */
 				if (!maxretry--) {
@@ -380,7 +423,7 @@ static ssize_t
 read_aw(struct file *file, char __user *buffer, size_t count, loff_t * ppos)
 {
 	DEFINE_WAIT(wait);
-	struct aw_usb_data *aw = &aw_instance;
+	struct allwinner_usb *aw = &aw_instance;
 	ssize_t read_count;
 	unsigned int partial;
 	int this_read;
@@ -393,7 +436,7 @@ read_aw(struct file *file, char __user *buffer, size_t count, loff_t * ppos)
 	if (intr)
 		return -EINTR;
 	/* Sanity check to make sure aw is connected, powered, etc */
-        if (aw->present == 0 || aw->aw_dev == NULL) {
+	if (aw->present == 0 || aw->aw_dev == NULL) {
 		mutex_unlock(&(aw->lock));
 		return -ENODEV;
 	}
@@ -412,15 +455,15 @@ read_aw(struct file *file, char __user *buffer, size_t count, loff_t * ppos)
 			mutex_unlock(&(aw->lock));
 			return -ENODEV;
 		}
-		this_read = (count >= IBUF_SIZE) ? IBUF_SIZE : count;
+		this_read = (count >= aw->bulk_in_size) ? aw->bulk_in_size : count;
 
 		result = usb_bulk_msg(aw->aw_dev,
-				      usb_rcvbulkpipe(aw->aw_dev, 1),
-				      ibuf, this_read, &partial,
-				      60000);
+				usb_rcvbulkpipe(aw->aw_dev, aw->bulk_in_endpointAddr),
+				ibuf, this_read, &partial,
+				MAX_TIME_WAIT);
 
 		printk(KERN_DEBUG"read stats: result:%d this_read:%u partial:%u",
-		       result, this_read, partial);
+				result, this_read, partial);
 
 		if (partial) {
 			count = this_read = partial;
@@ -437,7 +480,7 @@ read_aw(struct file *file, char __user *buffer, size_t count, loff_t * ppos)
 		} else if (result != -EREMOTEIO) {
 			mutex_unlock(&(aw->lock));
 			printk(KERN_ERR"Read Whoops - result:%u partial:%u this_read:%u",
-			     result, partial, this_read);
+					result, partial, this_read);
 			return -EIO;
 		} else {
 			mutex_unlock(&(aw->lock));
@@ -474,14 +517,43 @@ static struct usb_class_driver usb_aw_class = {
 };
 
 static int probe_aw(struct usb_interface *intf,
-		     const struct usb_device_id *id)
+		const struct usb_device_id *id)
 {
 	struct usb_device *dev = interface_to_usbdev(intf);
-	struct aw_usb_data *aw = &aw_instance;
+	struct allwinner_usb *aw = &aw_instance;
 	int retval;
+#if 0
+	struct usb_host_interface *iface_desc;
+	struct usb_endpoint_descriptor *endpoint;
+	size_t buffer_size;
+	int i;
 
-	dev_info(&intf->dev, "USB aw found at address %d\n", dev->devnum);
+	iface_desc = intf->cur_altsetting;
+	for (i = 0; i < iface_desc->desc.bNumEndpoints; ++i) {
+		endpoint = &iface_desc->endpoint[i].desc;
 
+		if (!aw->bulk_in_endpointAddr &&
+				usb_endpoint_is_bulk_in(endpoint)) {
+			/* we found a bulk in endpoint */
+			buffer_size = le16_to_cpu(endpoint->wMaxPacketSize);
+			aw->bulk_in_size = IBUF_SIZE;
+			aw->bulk_in_endpointAddr = endpoint->bEndpointAddress;
+			printk(KERN_DEBUG"bulk_in_endpointAddr = %d\n", endpoint->bEndpointAddress);
+		}
+
+		if (!aw->bulk_out_endpointAddr &&
+				usb_endpoint_is_bulk_out(endpoint)) {
+			/* we found a bulk out endpoint */
+			aw->bulk_out_endpointAddr = endpoint->bEndpointAddress;
+			printk(KERN_DEBUG"bulk_out_endpointAddr = %d\n", endpoint->bEndpointAddress);
+		}
+	}
+	if (!(aw->bulk_in_endpointAddr && aw->bulk_out_endpointAddr)) {
+		err("Could not find both bulk-in and bulk-out endpoints");
+		return -EPIPE;
+	}
+
+#endif
 	retval = usb_register_dev(intf, &usb_aw_class);
 	if (retval) {
 		printk(KERN_ERR"Not able to get a minor for this device.");
@@ -489,21 +561,21 @@ static int probe_aw(struct usb_interface *intf,
 	}
 
 	aw->aw_dev = dev;
+	aw->aw_intf = intf;
+	aw->bulk_in_size = IBUF_SIZE;
 
 	if (!(aw->obuf = kmalloc(OBUF_SIZE, GFP_KERNEL))) {
 		printk(KERN_ERR"probe_aw: Not enough memory for the output buffer");
 		usb_deregister_dev(intf, &usb_aw_class);
 		return -ENOMEM;
 	}
-	printk(KERN_DEBUG"probe_aw: obuf address:%p", aw->obuf);
 
-	if (!(aw->ibuf = kmalloc(IBUF_SIZE, GFP_KERNEL))) {
+	if (!(aw->ibuf = kmalloc(aw->bulk_in_size, GFP_KERNEL))) {
 		printk(KERN_ERR"probe_aw: Not enough memory for the input buffer");
 		usb_deregister_dev(intf, &usb_aw_class);
 		kfree(aw->obuf);
 		return -ENOMEM;
 	}
-	printk(KERN_DEBUG"probe_aw: ibuf address:%p", aw->ibuf);
 
 	mutex_init(&(aw->lock));
 
@@ -515,7 +587,7 @@ static int probe_aw(struct usb_interface *intf,
 
 static void disconnect_aw(struct usb_interface *intf)
 {
-	struct aw_usb_data *aw = usb_get_intfdata (intf);
+	struct allwinner_usb *aw = usb_get_intfdata (intf);
 
 	usb_set_intfdata (intf, NULL);
 	if (aw) {
@@ -539,21 +611,6 @@ static void disconnect_aw(struct usb_interface *intf)
 	}
 }
 
-static struct usb_device_id aw_table [] = {
-	{ USB_DEVICE(0x1f3a, 0xefe8) }, 		/* aw usb device */
-//    { USB_DEVICE(0x0525, 0xa444) }, 		/* 0xa4a0, Linux-USB "Gadget Zero" */
-	{ }					/* Terminating entry */
-};
-
-MODULE_DEVICE_TABLE (usb, aw_table);
-
-static struct usb_driver aw_driver = {
-	.name =		"aw",
-	.probe =	probe_aw,
-	.disconnect =	disconnect_aw,
-	.id_table =	aw_table,
-};
-
 static int __init usb_aw_init(void)
 {
 	int retval;
@@ -562,7 +619,7 @@ static int __init usb_aw_init(void)
 		goto out;
 
 	printk(KERN_INFO KBUILD_MODNAME ": " DRIVER_VERSION ":"
-	       DRIVER_DESC "\n");
+			DRIVER_DESC "\n");
 
 out:
 	return retval;
@@ -571,7 +628,7 @@ out:
 
 static void __exit usb_aw_cleanup(void)
 {
-	struct aw_usb_data *aw = &aw_instance;
+	struct allwinner_usb *aw = &aw_instance;
 
 	aw->present = 0;
 	usb_deregister(&aw_driver);
