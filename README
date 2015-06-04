@@ -12,10 +12,10 @@ wiki at http://linux-sunxi.org/LiveSuit
 Installing the kernel module.
 -----------------------------
 
-First you need to install dkms on your system.
+First you need to install dkms and libpng12 on your system.
 
 On a debian or ubuntu this is as simple as (as root):
-# apt-get install dkms
+# apt-get install dkms libpng12
 
 You can then descend into the awusb/ directory and just run:
 > make
@@ -24,7 +24,7 @@ Then copy it over to to your kernel modules:
 # cp awusb.ko /lib/modules/`uname -r`/kernel/
 
 Load the module by running:
-# modprobe awusb
+# depmod -a && modprobe awusb
 
 Running LiveSuit.
 -----------------
