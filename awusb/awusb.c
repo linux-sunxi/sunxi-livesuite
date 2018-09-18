@@ -41,6 +41,7 @@
 /* by Cesc */
 #include <linux/ioctl.h>
 #include <linux/mutex.h> //?
+#include <linux/sched/signal.h>
 
 
 /*
