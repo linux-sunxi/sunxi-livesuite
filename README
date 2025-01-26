@@ -20,6 +20,12 @@ On a debian or ubuntu this is as simple as (as root):
 You can then descend into the awusb/ directory and just run:
 > make
 
+Note that on ubuntu 23.10 we get this error after make runs:
+make[3]: *** No rule to make target 'arch/x86/entry/syscalls/syscall_32.tbl', needed by 'arch/x86/include/generated/uapi/asm/unistd_32.h'.  Stop.
+
+To resolve this issue run this command before make:
+export KBUILD_EXTMOD=$(pwd)
+
 Then copy it over to to your kernel modules:
 # cp awusb.ko /lib/modules/`uname -r`/kernel/
 
